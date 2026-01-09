@@ -5,8 +5,8 @@ Sodré Santoro Monitor - Histórico de Lances
 
 FUNCIONAMENTO:
 1. Carrega TODOS os itens Sodré Santoro ativos da view vw_auctions_unified
-2. Scraping via Playwright nas 4 categorias (pega links dos lotes)
-3. Para cada lote matched: ENTRA na página e extrai tabela #tabela_lances
+2. Scraping via Playwright nas 4 categorias (coleta links dos cards)
+3. Para cada lote matched: ENTRA na página do lote e extrai tabela #tabela_lances
 4. Atualiza tabelas base + salva histórico na auction_bid_history
 """
 
@@ -23,7 +23,7 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Categorias Sodré Santoro
+# Categorias Sodré Santoro (URLs reais do site)
 SODRE_CATEGORIES = [
     'https://www.sodresantoro.com.br/veiculos/lotes?sort=auction_date_init_asc',
     'https://www.sodresantoro.com.br/materiais/lotes?sort=auction_date_init_asc',
@@ -98,7 +98,7 @@ class SodreSantoroMonitor:
             print(f"❌ Erro ao carregar itens: {e}")
             return False
     
-    def scrape_lot_links(self, page, category_url: str):
+    def scrape_lot_links_from_category(self, page, category_url: str):
         """Scraping de links de lotes de uma categoria"""
         lot_links = []
         category_name = category_url.split('/')[3]  # extrai 'veiculos', 'materiais', etc
@@ -106,13 +106,13 @@ class SodreSantoroMonitor:
         try:
             print(f"   → Acessando listagem {category_name}...")
             page.goto(category_url, wait_until='domcontentloaded', timeout=60000)
-            time.sleep(3)  # Espera inicial
+            time.sleep(3)
             
             # Tenta encontrar cards primeiro
             try:
                 page.wait_for_selector('a[href*="/leilao/"]', timeout=10000)
             except:
-                print(f"   → Nenhum lote encontrado em {category_name}")
+                print(f"   ⚪ Nenhum lote encontrado")
                 return [], category_name
             
             # Loop de paginação (botão "Avançar")
@@ -121,7 +121,7 @@ class SodreSantoroMonitor:
             seen_links = set()
             
             while current_page <= max_pages:
-                # Extrai links da página atual
+                # Extrai links da página atual - seletor do scraper original
                 cards = page.query_selector_all('a[href*="/leilao/"][href*="/lote/"]')
                 
                 page_links = 0
@@ -135,9 +135,10 @@ class SodreSantoroMonitor:
                         lot_links.append(href)
                         page_links += 1
                 
-                print(f"   → Página {current_page}: +{page_links} lotes (total: {len(lot_links)})")
+                if page_links > 0:
+                    print(f"   → Página {current_page}: +{page_links} lotes", flush=True)
                 
-                # Verifica botão "Avançar"
+                # Verifica botão "Avançar" não desabilitado
                 next_button = page.query_selector('button[title="Avançar"]:not([disabled])')
                 
                 if not next_button or current_page >= max_pages:
@@ -152,18 +153,18 @@ class SodreSantoroMonitor:
                 except:
                     break
             
-            print(f"   → Total: {len(lot_links)} lotes únicos em {category_name}")
+            print(f"   ✅ {category_name}: {len(lot_links)} lotes coletados")
             
         except Exception as e:
-            print(f"❌ Erro em {category_url}: {e}")
+            print(f"   ❌ Erro em {category_name}: {e}")
         
         return lot_links, category_name
     
     def extract_bid_data_from_lot_page(self, page, lot_url: str):
         """Entra na página do lote e extrai dados da tabela #tabela_lances"""
         try:
-            page.goto(lot_url, wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(2000)
+            page.goto(lot_url, wait_until='domcontentloaded', timeout=30000)
+            time.sleep(2)
             
             # Procura a tabela de lances
             table = page.query_selector('#tabela_lances')
@@ -196,12 +197,13 @@ class SodreSantoroMonitor:
             }
             
         except Exception as e:
-            print(f"⚠️ Erro ao extrair {lot_url}: {e}")
+            # Silencioso para não poluir logs
             return None
     
-    def process_lots(self, page, lot_links):
-        """Processa lotes: match com DB + extrai dados"""
+    def process_lots_with_bids(self, page, lot_links):
+        """Processa lotes: match com DB + extrai dados de lances"""
         matched_data = []
+        processed = 0
         
         for lot_url in lot_links:
             normalized_link = self.normalize_link(lot_url)
@@ -213,6 +215,13 @@ class SodreSantoroMonitor:
             
             # Entra na página do lote e extrai dados
             bid_data = self.extract_bid_data_from_lot_page(page, lot_url)
+            
+            processed += 1
+            
+            # Log a cada 50 processados
+            if processed % 50 == 0:
+                print(f"   → Processados {processed}/{len(lot_links)} lotes | {len(matched_data)} com lances")
+            
             if not bid_data:
                 continue
             
@@ -323,19 +332,23 @@ class SodreSantoroMonitor:
         category_stats = []
         
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled']
+            )
             context = browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                locale='pt-BR',
             )
             page = context.new_page()
             
-            print("\n🌐 Fase 1: Coletando links dos lotes...\n")
+            print("\n🌐 Fase 1: Coletando links dos lotes nas 4 categorias...\n")
             
             all_lot_links = []
             
             for category_url in SODRE_CATEGORIES:
-                lot_links, cat_name = self.scrape_lot_links(page, category_url)
+                lot_links, cat_name = self.scrape_lot_links_from_category(page, category_url)
                 
                 # Filtra apenas links que estão no banco
                 matched_links = []
@@ -353,17 +366,18 @@ class SodreSantoroMonitor:
                 })
             
             # Exibe stats da fase 1
+            print(f"\n📊 Resumo da Fase 1:")
             for stat in category_stats:
                 name = stat["name"]
                 total = stat["total_links"]
                 matched = stat["matched_links"]
                 
                 if matched > 0:
-                    print(f"✅ {name:25s} | {total:3d} lotes | {matched:3d} no banco")
+                    print(f"✅ {name:15s} | {total:4d} scraped | {matched:4d} no banco")
                 else:
-                    print(f"⚪ {name:25s} | {total:3d} lotes | 0 no banco")
+                    print(f"⚪ {name:15s} | {total:4d} scraped | 0 no banco")
             
-            print(f"\n📊 Total de lotes matched: {len(all_lot_links)}")
+            print(f"\n📋 Total de lotes matched: {len(all_lot_links)}")
             
             if not all_lot_links:
                 browser.close()
@@ -372,17 +386,10 @@ class SodreSantoroMonitor:
             
             print(f"\n🔍 Fase 2: Entrando em cada lote para extrair lances...\n")
             
-            # Processa lotes em lote (a cada 50 para dar feedback)
-            batch_size = 50
-            processed = 0
+            # Processa todos os lotes matched
+            all_matched = self.process_lots_with_bids(page, all_lot_links)
             
-            for i in range(0, len(all_lot_links), batch_size):
-                batch = all_lot_links[i:i+batch_size]
-                batch_matched = self.process_lots(page, batch)
-                all_matched.extend(batch_matched)
-                
-                processed += len(batch)
-                print(f"   → Processados {processed}/{len(all_lot_links)} lotes | {len(batch_matched)} com lances")
+            print(f"   ✅ Processamento concluído: {len(all_matched)} lotes com lances")
             
             browser.close()
         
