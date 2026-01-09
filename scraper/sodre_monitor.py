@@ -110,7 +110,15 @@ class SodreMonitor:
                 
                 offset += page_size
             
-            print(f"✅ {len(self.db_items)} itens Sodré carregados da view\n")
+            print(f"✅ {len(self.db_items)} itens Sodré carregados da view")
+            
+            # Mostra exemplos de links do banco
+            if self.db_items:
+                print(f"\n📋 Exemplos de links no banco:")
+                for i, link in enumerate(list(self.db_items.keys())[:3]):
+                    print(f"   {i+1}. {link}")
+                print()
+            
             return True
             
         except Exception as e:
@@ -236,12 +244,39 @@ class SodreMonitor:
             await browser.close()
         
         # Indexa lotes por link (chave única)
-        for lot in all_lots:
-            # Suporta diferentes estruturas de ID
-            lot_id = lot.get('lot_id') or lot.get('id')
-            if lot_id:
-                link = f"https://www.sodresantoro.com.br/veiculos/lote/{lot_id}"
+        print("🔍 Analisando estrutura dos lotes capturados...\n")
+        
+        success_count = 0
+        failed_count = 0
+        
+        for i, lot in enumerate(all_lots):
+            # Extrai auction_id e lot_id para construir o link correto
+            auction_id = lot.get('auction_id')
+            lot_id = lot.get('lot_id')
+            
+            if auction_id and lot_id:
+                # Formato: https://leilao.sodresantoro.com.br/leilao/{auction_id}/lote/{lot_id}/
+                link = f"https://leilao.sodresantoro.com.br/leilao/{auction_id}/lote/{lot_id}/"
                 self.api_lots[link] = lot
+                success_count += 1
+                
+                # Log do primeiro lote como exemplo
+                if i == 0:
+                    print(f"📋 Exemplo de lote processado:")
+                    print(f"   auction_id: {auction_id}")
+                    print(f"   lot_id: {lot_id}")
+                    print(f"   lot_number: {lot.get('lot_number')}")
+                    print(f"   lot_title: {lot.get('lot_title')}")
+                    print(f"   bid_actual: {lot.get('bid_actual')}")
+                    print(f"   lot_visits: {lot.get('lot_visits')}")
+                    print(f"   Link gerado: {link}\n")
+            else:
+                failed_count += 1
+                if failed_count <= 3:  # Mostra até 3 exemplos de falha
+                    print(f"   ⚠️ Lote sem auction_id ou lot_id: {lot.get('id', lot.get('lot_number', 'unknown'))}")
+        
+        if failed_count > 3:
+            print(f"   ... e mais {failed_count - 3} lotes sem IDs válidos\n")
         
         print(f"\n✅ {len(self.api_lots)} lotes únicos capturados da API\n")
         return len(self.api_lots) > 0
