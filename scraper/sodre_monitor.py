@@ -81,7 +81,7 @@ class SodreMonitor:
             
             while True:
                 response = self.supabase.schema("auctions").table("vw_auctions_unified")\
-                    .select("link,category,source,external_id,lot_number,bid_actual,lot_visits")\
+                    .select("link,category,source,external_id,lot_number")\
                     .eq("source", "sodre")\
                     .eq("is_active", True)\
                     .range(offset, offset + page_size - 1)\
@@ -98,8 +98,8 @@ class SodreMonitor:
                             "source": item.get("source"),
                             "external_id": item.get("external_id"),
                             "lot_number": item.get("lot_number"),
-                            "prev_bid": float(item.get("bid_actual") or 0),
-                            "prev_visits": int(item.get("lot_visits") or 0),
+                            "prev_bid": 0,  # Será comparado com dados da API
+                            "prev_visits": 0,  # Será comparado com dados da API
                         }
                 
                 total_loaded += len(response.data)
