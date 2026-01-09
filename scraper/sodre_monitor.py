@@ -115,8 +115,8 @@ class SodreSantoroMonitor:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(2000)
                 
-                # Conta lotes atuais
-                current_lots = page.query_selector_all('a[href*="/lote/"]')
+                # Conta lotes atuais - usa seletor mais específico
+                current_lots = page.query_selector_all('a[href*="leilao.sodresantoro.com.br/leilao/"]')
                 current_count = len(current_lots)
                 
                 if current_count == prev_count:
@@ -128,17 +128,26 @@ class SodreSantoroMonitor:
                 
                 prev_count = current_count
             
-            # Extrai todos os links únicos
-            link_elements = page.query_selector_all('a[href*="/lote/"]')
+            # Extrai todos os links únicos - múltiplos seletores para garantir
+            selectors = [
+                'a[href*="leilao.sodresantoro.com.br/leilao/"]',
+                'a[href*="/lote/"]',
+                'div[id^="lot-"] a',
+            ]
             
             seen_links = set()
-            for elem in link_elements:
-                href = elem.get_attribute('href')
-                if href and href not in seen_links:
-                    if href.startswith('/'):
-                        href = f"https://www.sodresantoro.com.br{href}"
-                    seen_links.add(href)
-                    lot_links.append(href)
+            
+            for selector in selectors:
+                link_elements = page.query_selector_all(selector)
+                
+                for elem in link_elements:
+                    href = elem.get_attribute('href')
+                    if href and '/lote/' in href and href not in seen_links:
+                        # Normaliza o link
+                        if href.startswith('/'):
+                            href = f"https://leilao.sodresantoro.com.br{href}"
+                        seen_links.add(href)
+                        lot_links.append(href)
             
             print(f"   → Encontrados {len(lot_links)} lotes únicos em {category_name}")
             
