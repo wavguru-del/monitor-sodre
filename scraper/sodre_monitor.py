@@ -33,10 +33,17 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# URLs para monitorar (Sodré Santoro - Veículos)
+# URLs para monitorar (Sodré Santoro)
+# IMPORTANTE: Adicione aqui todas as URLs de leilões ativos
 SODRE_URLS = [
+    # Veículos - ordenado por data de início
     "https://www.sodresantoro.com.br/veiculos/lotes?sort=auction_date_init_asc",
+    # Alternativa: todos os lotes sem filtro
+    "https://www.sodresantoro.com.br/veiculos/lotes",
 ]
+
+# NOTA: Se você tem múltiplos leilões ativos (27960, 28041, etc),
+# considere adicionar URLs específicas ou melhorar a paginação
 
 # Critérios para detectar "itens quentes"
 HOT_ITEM_THRESHOLD_VALUE = 1000  # R$ 1.000 de aumento
@@ -166,8 +173,11 @@ class SodreMonitor:
             page = await context.new_page()
             
             # Função que captura respostas da API
+            lots_before_page = 0
+            
             async def intercept_response(response):
                 """Escuta passivamente as respostas do site"""
+                nonlocal lots_before_page
                 try:
                     if '/api/search-lots' in response.url and response.status == 200:
                         data = await response.json()
@@ -182,11 +192,11 @@ class SodreMonitor:
                             
                             if results:
                                 all_lots.extend(results)
-                                print(f"   ✓ Capturados {len(results)} lotes (results)")
+                                print(f"   ✓ Capturados {len(results)} lotes (results) - Total: {len(all_lots)}")
                             elif hits:
                                 extracted = [hit.get('_source', hit) for hit in hits]
                                 all_lots.extend(extracted)
-                                print(f"   ✓ Capturados {len(hits)} lotes (hits)")
+                                print(f"   ✓ Capturados {len(hits)} lotes (hits) - Total: {len(all_lots)}")
                 
                 except Exception:
                     pass  # Ignora erros de parse
@@ -201,20 +211,33 @@ class SodreMonitor:
                     await page.goto(url, wait_until="networkidle", timeout=60000)
                     await asyncio.sleep(3)
                     
-                    # Paginação automática (até 30 páginas)
-                    for page_num in range(2, 31):
+                    # Verifica total de resultados disponíveis
+                    try:
+                        # Tenta encontrar indicador de total de resultados
+                        total_text = await page.text_content('.pagination-info, .results-count, [data-testid="total-results"]')
+                        if total_text:
+                            print(f"   ℹ️  Informação da página: {total_text}")
+                    except:
+                        pass
+                    
+                    # Paginação automática (até 50 páginas para garantir)
+                    for page_num in range(2, 51):
                         try:
-                            # Scroll suave
+                            # Scroll suave antes de clicar
                             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(2)
                             
-                            # Procura botão "próxima página"
+                            # Procura botão "próxima página" com múltiplos seletores
+                            # Baseado no HTML: <button type="button" title="Avançar"...>
                             selectors = [
-                                'button[aria-label*="next"]',
-                                'button[aria-label*="próxim"]',
+                                'button[title="Avançar"]:not([disabled])',
+                                'button[title*="Avanç"]:not([disabled])',
+                                'button[aria-label*="Avanç"]:not([disabled])',
+                                'button:has(.i-mdi\\:chevron-right):not([disabled])',
+                                'nav[aria-label*="Paginação"] button:last-child:not([disabled])',
                                 '.pagination button:last-child:not([disabled])',
-                                'button:has-text(">")',
-                                '[data-testid="next-page"]',
+                                'button:has-text(">"):not([disabled])',
+                                'a[rel="next"]:not([disabled])',
                             ]
                             
                             clicked = False
@@ -225,17 +248,19 @@ class SodreMonitor:
                                         is_disabled = await button.get_attribute('disabled')
                                         if is_disabled is None:
                                             await button.click()
-                                            await asyncio.sleep(3)
+                                            print(f"   ➡️  Navegando para página {page_num}...")
+                                            await asyncio.sleep(4)  # Aumenta tempo de espera
                                             clicked = True
                                             break
                                 except:
                                     continue
                             
                             if not clicked:
-                                print(f"   ℹ️  Fim da paginação (página {page_num-1})")
+                                print(f"   ℹ️  Paginação encerrada na página {page_num-1} (botão não encontrado ou desabilitado)")
                                 break
                         
-                        except Exception:
+                        except Exception as e:
+                            print(f"   ⚠️  Erro na paginação (página {page_num}): {e}")
                             break
                 
                 except Exception as e:
@@ -244,10 +269,20 @@ class SodreMonitor:
             await browser.close()
         
         # Indexa lotes por link (chave única)
-        print("🔍 Analisando estrutura dos lotes capturados...\n")
+        print("\n🔍 Analisando estrutura dos lotes capturados...\n")
         
         success_count = 0
         failed_count = 0
+        
+        # Debug: mostrar estrutura do primeiro lote
+        if all_lots:
+            first_lot = all_lots[0]
+            print("📋 Estrutura do primeiro lote da API:")
+            print(f"   Keys disponíveis: {list(first_lot.keys())[:10]}...")
+            print(f"   auction_id: {first_lot.get('auction_id')}")
+            print(f"   lot_id: {first_lot.get('lot_id')}")
+            print(f"   id: {first_lot.get('id')}")
+            print()
         
         for i, lot in enumerate(all_lots):
             # Extrai auction_id e lot_id para construir o link correto
@@ -260,25 +295,27 @@ class SodreMonitor:
                 self.api_lots[link] = lot
                 success_count += 1
                 
-                # Log do primeiro lote como exemplo
-                if i == 0:
-                    print(f"📋 Exemplo de lote processado:")
-                    print(f"   auction_id: {auction_id}")
-                    print(f"   lot_id: {lot_id}")
-                    print(f"   lot_number: {lot.get('lot_number')}")
-                    print(f"   lot_title: {lot.get('lot_title')}")
-                    print(f"   bid_actual: {lot.get('bid_actual')}")
-                    print(f"   lot_visits: {lot.get('lot_visits')}")
-                    print(f"   Link gerado: {link}\n")
+                # Log dos primeiros 3 links gerados
+                if i < 3:
+                    print(f"   {i+1}. Link gerado: {link}")
+                    print(f"      lot_number: {lot.get('lot_number')}, lot_title: {lot.get('lot_title')}")
             else:
                 failed_count += 1
-                if failed_count <= 3:  # Mostra até 3 exemplos de falha
+                if failed_count <= 3:
                     print(f"   ⚠️ Lote sem auction_id ou lot_id: {lot.get('id', lot.get('lot_number', 'unknown'))}")
         
         if failed_count > 3:
             print(f"   ... e mais {failed_count - 3} lotes sem IDs válidos\n")
         
-        print(f"\n✅ {len(self.api_lots)} lotes únicos capturados da API\n")
+        print(f"✅ {len(self.api_lots)} lotes únicos capturados da API")
+        
+        # DEBUG: Mostra exemplos de links da API
+        if self.api_lots:
+            print(f"\n📋 Exemplos de links gerados da API:")
+            for i, link in enumerate(list(self.api_lots.keys())[:5]):
+                print(f"   {i+1}. {link}")
+        
+        print()
         return len(self.api_lots) > 0
     
     # ========================================================================
@@ -294,6 +331,17 @@ class SodreMonitor:
         - hot_items: lista de itens com aumento súbito de lances
         """
         print("🔗 Cruzando dados (DB ↔ API)...\n")
+        
+        # Debug: mostrar comparação de links
+        if self.db_items and self.api_lots:
+            print("🔍 Comparação de Formatos:\n")
+            print("   📦 Exemplos do BANCO (primeiros 3):")
+            for i, link in enumerate(list(self.db_items.keys())[:3]):
+                print(f"      {i+1}. {link}")
+            print("\n   🌐 Exemplos da API (primeiros 3):")
+            for i, link in enumerate(list(self.api_lots.keys())[:3]):
+                print(f"      {i+1}. {link}")
+            print()
         
         matched_records = []
         hot_items = []
