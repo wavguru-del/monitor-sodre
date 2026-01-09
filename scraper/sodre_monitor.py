@@ -5,9 +5,9 @@ Sodré Santoro Monitor - Histórico de Lances
 
 FUNCIONAMENTO:
 1. Carrega TODOS os itens Sodré Santoro ativos da view vw_auctions_unified
-2. Scraping via Playwright nas 4 categorias
-3. Compara links (normaliza UTM params)
-4. Para cada match: atualiza tabelas base + salva histórico na auction_bid_history
+2. Scraping via Playwright nas 4 categorias (pega links dos lotes)
+3. Para cada lote matched: ENTRA na página e extrai tabela #tabela_lances
+4. Atualiza tabelas base + salva histórico na auction_bid_history
 """
 
 import os
@@ -97,68 +97,13 @@ class SodreSantoroMonitor:
             print(f"❌ Erro ao carregar itens: {e}")
             return False
     
-    def extract_lot_data(self, lot_card):
-        """Extrai dados de um card de lote Sodré Santoro"""
-        try:
-            # Link do lote
-            link_elem = lot_card.query_selector('a[href*="/lote/"]')
-            if not link_elem:
-                return None
-            
-            link = link_elem.get_attribute('href')
-            if not link:
-                return None
-            
-            # Normaliza link (adiciona domínio se necessário)
-            if link.startswith('/'):
-                link = f"https://www.sodresantoro.com.br{link}"
-            
-            # Número do lote (geralmente visível no card)
-            lot_number_elem = lot_card.query_selector('.lot-number, .lote-numero, [class*="lot"]')
-            lot_number = None
-            if lot_number_elem:
-                lot_text = lot_number_elem.inner_text().strip()
-                match = re.search(r'Lote\s*:?\s*(\d+)', lot_text, re.IGNORECASE)
-                if match:
-                    lot_number = match.group(1)
-            
-            # Valor atual
-            price_elem = lot_card.query_selector('.price, .valor, [class*="price"], [class*="valor"]')
-            current_value = 0
-            if price_elem:
-                price_text = price_elem.inner_text().strip()
-                # Remove tudo exceto dígitos e vírgula
-                price_clean = re.sub(r'[^\d,]', '', price_text)
-                if price_clean:
-                    current_value = float(price_clean.replace(',', '.'))
-            
-            # Lances (procura por "X lances" ou similar)
-            bids_elem = lot_card.query_selector('[class*="bid"], [class*="lance"]')
-            total_bids = 0
-            if bids_elem:
-                bids_text = bids_elem.inner_text().strip()
-                match = re.search(r'(\d+)\s*lances?', bids_text, re.IGNORECASE)
-                if match:
-                    total_bids = int(match.group(1))
-            
-            return {
-                "link": link,
-                "lot_number": lot_number,
-                "current_value": current_value,
-                "total_bids": total_bids,
-            }
-            
-        except Exception as e:
-            print(f"⚠️ Erro ao extrair lote: {e}")
-            return None
-    
-    def scrape_category(self, page, category_url: str):
-        """Scraping de uma categoria com scroll infinito"""
-        lots_data = []
+    def scrape_lot_links(self, page, category_url: str):
+        """Scraping de links de lotes de uma categoria"""
+        lot_links = []
         category_name = category_url.split('/')[3]  # extrai 'veiculos', 'materiais', etc
         
         try:
-            print(f"   → Acessando {category_name}...")
+            print(f"   → Acessando listagem {category_name}...")
             page.goto(category_url, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(3000)
             
@@ -167,12 +112,11 @@ class SodreSantoroMonitor:
             no_change_count = 0
             
             for scroll_attempt in range(15):  # Máximo 15 scrolls
-                # Scroll até o final
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(2000)
                 
                 # Conta lotes atuais
-                current_lots = page.query_selector_all('.lot-card, .lote-card, [class*="lot-"], article')
+                current_lots = page.query_selector_all('a[href*="/lote/"]')
                 current_count = len(current_lots)
                 
                 if current_count == prev_count:
@@ -184,46 +128,112 @@ class SodreSantoroMonitor:
                 
                 prev_count = current_count
             
-            # Extrai todos os lotes
-            lot_cards = page.query_selector_all('.lot-card, .lote-card, [class*="lot-"], article')
+            # Extrai todos os links únicos
+            link_elements = page.query_selector_all('a[href*="/lote/"]')
             
-            print(f"   → Encontrados {len(lot_cards)} cards em {category_name}")
+            seen_links = set()
+            for elem in link_elements:
+                href = elem.get_attribute('href')
+                if href and href not in seen_links:
+                    if href.startswith('/'):
+                        href = f"https://www.sodresantoro.com.br{href}"
+                    seen_links.add(href)
+                    lot_links.append(href)
             
-            for card in lot_cards:
-                lot_data = self.extract_lot_data(card)
-                if lot_data:
-                    lots_data.append(lot_data)
+            print(f"   → Encontrados {len(lot_links)} lotes únicos em {category_name}")
             
         except Exception as e:
             print(f"❌ Erro em {category_url}: {e}")
         
-        return lots_data, category_name
+        return lot_links, category_name
     
-    def process_scraped_data(self, scraped_items):
-        """Processa dados scraped e faz match com banco"""
-        all_records = []
-        
-        for item in scraped_items:
-            link = self.normalize_link(item["link"])
+    def extract_bid_data_from_lot_page(self, page, lot_url: str):
+        """Entra na página do lote e extrai dados da tabela #tabela_lances"""
+        try:
+            page.goto(lot_url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(2000)
             
-            db_item = self.db_items.get(link)
+            # Procura a tabela de lances
+            table = page.query_selector('#tabela_lances')
+            if not table:
+                return None
+            
+            # Conta linhas de lances (tr com class contendo 'tr_')
+            bid_rows = table.query_selector_all('tr[class*="tr_"]')
+            total_bids = len(bid_rows)
+            
+            if total_bids == 0:
+                return None
+            
+            # Pega o lance mais recente (primeiro da lista)
+            first_row = bid_rows[0]
+            tds = first_row.query_selector_all('td')
+            
+            if len(tds) < 2:
+                return None
+            
+            # Segunda coluna = valor do lance
+            value_text = tds[1].inner_text().strip()
+            # Remove tudo exceto dígitos e vírgula
+            value_clean = re.sub(r'[^\d,]', '', value_text)
+            current_value = float(value_clean.replace(',', '.')) if value_clean else 0
+            
+            return {
+                "total_bids": total_bids,
+                "current_value": current_value,
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Erro ao extrair {lot_url}: {e}")
+            return None
+    
+    def process_lots(self, page, lot_links):
+        """Processa lotes: match com DB + extrai dados"""
+        matched_data = []
+        
+        for lot_url in lot_links:
+            normalized_link = self.normalize_link(lot_url)
+            
+            # Verifica se o lote está no banco
+            db_item = self.db_items.get(normalized_link)
             if not db_item:
                 continue
             
-            record = {
+            # Entra na página do lote e extrai dados
+            bid_data = self.extract_bid_data_from_lot_page(page, lot_url)
+            if not bid_data:
+                continue
+            
+            matched_data.append({
+                "link": lot_url,
                 "category": db_item["category"],
                 "source": db_item["source"],
                 "external_id": db_item["external_id"],
                 "lot_number": db_item["lot_number"],
-                "total_bids": item["total_bids"],
-                "total_bidders": 0,  # Sodré não fornece no card
-                "current_value": item["current_value"],
-                "captured_at": datetime.now().isoformat(),
-            }
-            
-            all_records.append(record)
+                "total_bids": bid_data["total_bids"],
+                "current_value": bid_data["current_value"],
+            })
         
-        return all_records
+        return matched_data
+    
+    def create_history_records(self, matched_data):
+        """Cria registros para histórico"""
+        records = []
+        captured_at = datetime.now().isoformat()
+        
+        for item in matched_data:
+            records.append({
+                "category": item["category"],
+                "source": item["source"],
+                "external_id": item["external_id"],
+                "lot_number": item["lot_number"],
+                "total_bids": item["total_bids"],
+                "total_bidders": 0,  # Sodré não fornece
+                "current_value": item["current_value"],
+                "captured_at": captured_at,
+            })
+        
+        return records
     
     def update_base_tables(self, records):
         """Atualiza tabelas base com dados de lances"""
@@ -297,7 +307,7 @@ class SodreSantoroMonitor:
             return True
         
         # Scraping com Playwright
-        all_scraped = []
+        all_matched = []
         category_stats = []
         
         with sync_playwright() as p:
@@ -308,41 +318,64 @@ class SodreSantoroMonitor:
             )
             page = context.new_page()
             
-            print("\n🌐 Buscando ofertas via scraping e comparando links...\n")
+            print("\n🌐 Fase 1: Coletando links dos lotes...\n")
+            
+            all_lot_links = []
             
             for category_url in SODRE_CATEGORIES:
-                lots, cat_name = self.scrape_category(page, category_url)
-                all_scraped.extend(lots)
+                lot_links, cat_name = self.scrape_lot_links(page, category_url)
                 
-                # Calcula matches desta categoria
-                cat_matches = 0
-                for item in lots:
-                    link = self.normalize_link(item["link"])
-                    if link in self.db_items:
-                        cat_matches += 1
+                # Filtra apenas links que estão no banco
+                matched_links = []
+                for link in lot_links:
+                    normalized = self.normalize_link(link)
+                    if normalized in self.db_items:
+                        matched_links.append(link)
+                
+                all_lot_links.extend(matched_links)
                 
                 category_stats.append({
                     "name": cat_name,
-                    "scraped": len(lots),
-                    "matches": cat_matches
+                    "total_links": len(lot_links),
+                    "matched_links": len(matched_links)
                 })
+            
+            # Exibe stats da fase 1
+            for stat in category_stats:
+                name = stat["name"]
+                total = stat["total_links"]
+                matched = stat["matched_links"]
+                
+                if matched > 0:
+                    print(f"✅ {name:25s} | {total:3d} lotes | {matched:3d} no banco")
+                else:
+                    print(f"⚪ {name:25s} | {total:3d} lotes | 0 no banco")
+            
+            print(f"\n📊 Total de lotes matched: {len(all_lot_links)}")
+            
+            if not all_lot_links:
+                browser.close()
+                print("\n⚠️ Nenhum lote matched para processar")
+                return True
+            
+            print(f"\n🔍 Fase 2: Entrando em cada lote para extrair lances...\n")
+            
+            # Processa lotes em lote (a cada 50 para dar feedback)
+            batch_size = 50
+            processed = 0
+            
+            for i in range(0, len(all_lot_links), batch_size):
+                batch = all_lot_links[i:i+batch_size]
+                batch_matched = self.process_lots(page, batch)
+                all_matched.extend(batch_matched)
+                
+                processed += len(batch)
+                print(f"   → Processados {processed}/{len(all_lot_links)} lotes | {len(batch_matched)} com lances")
             
             browser.close()
         
-        # Exibe stats por categoria
-        for stat in category_stats:
-            name = stat["name"]
-            scraped = stat["scraped"]
-            matches = stat["matches"]
-            
-            if matches > 0:
-                print(f"✅ {name:25s} | {scraped:3d} scraped | {matches:3d} matches")
-            else:
-                print(f"⚪ {name:25s} | {scraped:3d} scraped | 0 matches")
-        
-        # Processa e salva
-        all_records = self.process_scraped_data(all_scraped)
-        matched_count = len(all_records)
+        # Cria registros de histórico
+        all_records = self.create_history_records(all_matched)
         
         print("\n" + "="*70)
         print("🔄 Atualizando tabelas base (total_bids, value, last_scraped_at)...")
@@ -357,19 +390,14 @@ class SodreSantoroMonitor:
         print("📊 RESUMO DA EXECUÇÃO")
         print("="*70)
         print(f"📋 Itens Sodré Santoro na view: {len(self.db_items)}")
-        print(f"🌐 Ofertas scraped: {len(all_scraped)}")
-        print(f"🔗 Links matched (encontrados): {matched_count}")
+        print(f"🔗 Lotes matched (no banco): {len(all_lot_links)}")
+        print(f"🎯 Lotes com lances extraídos: {len(all_matched)}")
         print(f"🔄 Tabelas base atualizadas: {updated}")
         print(f"💾 Registros salvos no histórico: {saved}")
         print("="*70)
         
-        if len(self.db_items) > 0:
-            print(f"\n📈 Taxa de match: {(matched_count/len(self.db_items)*100):.1f}%")
-        
-        if matched_count < len(self.db_items) * 0.1:
-            print(f"⚠️ Poucos matches! Verifique se:")
-            print(f"   - Os links no banco estão no formato correto")
-            print(f"   - As ofertas ainda estão ativas no site")
+        if len(all_lot_links) > 0:
+            print(f"\n📈 Taxa de extração: {(len(all_matched)/len(all_lot_links)*100):.1f}%")
         
         return True
 
