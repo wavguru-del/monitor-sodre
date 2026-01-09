@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sodré Santoro Monitor - Histórico de Lances
+Sodré Santoro Monitor - Histórico de Lances (ASYNC)
 
-FUNCIONAMENTO OTIMIZADO:
-1. Carrega links da view vw_auctions_unified (source="sodre", is_active=True)
-2. Para cada link: ENTRA na página e extrai tabela #tabela_lances
+FUNCIONAMENTO OTIMIZADO COM ASYNCIO:
+1. Carrega TODOS os itens ativos da view
+2. Processa em PARALELO (asyncio) para máxima velocidade
 3. UPDATE tabelas base + INSERT histórico
 """
 
 import os
 import sys
 import re
-import time
+import asyncio
 from datetime import datetime
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from supabase import create_client, Client
 
 # Configuração
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# Paralelismo (ajuste conforme necessário)
+MAX_CONCURRENT = 15  # 15 lotes simultâneos
+
 
 class SodreSantoroMonitor:
-    """Monitor de lances Sodré Santoro"""
+    """Monitor de lances Sodré Santoro (ASYNC)"""
     
     def __init__(self):
         """Inicializa conexões"""
@@ -31,10 +34,12 @@ class SodreSantoroMonitor:
             raise ValueError("SUPABASE_URL e SUPABASE_KEY devem estar definidas")
         
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        self.db_items = []  # Lista de {link, category, source, external_id, lot_number}
+        self.db_items = []
+        self.processed = 0
+        self.with_bids = 0
     
     def load_database_items(self):
-        """Carrega itens ativos do banco com seus links"""
+        """Carrega TODOS os itens ativos do banco"""
         print("📥 Carregando itens do banco (Sodré Santoro ativos)...")
         
         try:
@@ -78,19 +83,19 @@ class SodreSantoroMonitor:
             print(f"❌ Erro ao carregar itens: {e}")
             return False
     
-    def extract_bid_data_from_lot_page(self, page, lot_url: str):
+    async def extract_bid_data_from_lot_page(self, page, lot_url: str):
         """Entra na página do lote e extrai dados da tabela #tabela_lances"""
         try:
-            page.goto(lot_url, wait_until='domcontentloaded', timeout=30000)
-            time.sleep(1.5)
+            await page.goto(lot_url, wait_until='domcontentloaded', timeout=30000)
+            await asyncio.sleep(0.8)
             
             # Procura a tabela de lances
-            table = page.query_selector('#tabela_lances')
+            table = await page.query_selector('#tabela_lances')
             if not table:
                 return None
             
-            # Conta linhas de lances (tr com class contendo 'tr_')
-            bid_rows = table.query_selector_all('tr[class*="tr_"]')
+            # Conta linhas de lances
+            bid_rows = await table.query_selector_all('tr[class*="tr_"]')
             total_bids = len(bid_rows)
             
             if total_bids == 0:
@@ -98,14 +103,14 @@ class SodreSantoroMonitor:
             
             # Pega o lance mais recente (primeiro da lista)
             first_row = bid_rows[0]
-            tds = first_row.query_selector_all('td')
+            tds = await first_row.query_selector_all('td')
             
             if len(tds) < 2:
                 return None
             
             # Segunda coluna = valor do lance
-            value_text = tds[1].inner_text().strip()
-            # Remove tudo exceto dígitos e vírgula
+            value_text = await tds[1].inner_text()
+            value_text = value_text.strip()
             value_clean = re.sub(r'[^\d,]', '', value_text)
             current_value = float(value_clean.replace(',', '.')) if value_clean else 0
             
@@ -117,35 +122,73 @@ class SodreSantoroMonitor:
         except Exception as e:
             return None
     
-    def process_all_lots(self, page):
-        """Processa todos os lotes do banco"""
-        matched_data = []
+    async def process_single_lot(self, browser, item, semaphore):
+        """Processa um único lote (com semaphore para limitar paralelismo)"""
+        async with semaphore:
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                locale='pt-BR',
+            )
+            page = await context.new_page()
+            
+            try:
+                lot_url = item["link"]
+                bid_data = await self.extract_bid_data_from_lot_page(page, lot_url)
+                
+                self.processed += 1
+                
+                # Log a cada 50 processados
+                if self.processed % 50 == 0:
+                    print(f"   → Processados {self.processed}/{len(self.db_items)} lotes | {self.with_bids} com lances")
+                
+                if not bid_data:
+                    return None
+                
+                self.with_bids += 1
+                
+                return {
+                    "link": lot_url,
+                    "category": item["category"],
+                    "source": item["source"],
+                    "external_id": item["external_id"],
+                    "lot_number": item["lot_number"],
+                    "total_bids": bid_data["total_bids"],
+                    "current_value": bid_data["current_value"],
+                }
+                
+            except Exception as e:
+                return None
+            finally:
+                await context.close()
+    
+    async def process_all_lots_async(self):
+        """Processa todos os lotes em paralelo com asyncio"""
         total = len(self.db_items)
+        print(f"\n🔍 Processando {total} lotes em paralelo (max {MAX_CONCURRENT} simultâneos)...\n")
         
-        print(f"\n🔍 Entrando em cada lote para extrair lances ({total} lotes)...\n")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            
+            # Semaphore para limitar concorrência
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+            
+            # Cria tasks para todos os lotes
+            tasks = [
+                self.process_single_lot(browser, item, semaphore)
+                for item in self.db_items
+            ]
+            
+            # Executa em paralelo
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            await browser.close()
         
-        for idx, item in enumerate(self.db_items, 1):
-            lot_url = item["link"]
-            
-            # Extrai dados de lances
-            bid_data = self.extract_bid_data_from_lot_page(page, lot_url)
-            
-            # Log a cada 50 processados
-            if idx % 50 == 0:
-                print(f"   → Processados {idx}/{total} lotes | {len(matched_data)} com lances")
-            
-            if not bid_data:
-                continue
-            
-            matched_data.append({
-                "link": lot_url,
-                "category": item["category"],
-                "source": item["source"],
-                "external_id": item["external_id"],
-                "lot_number": item["lot_number"],
-                "total_bids": bid_data["total_bids"],
-                "current_value": bid_data["current_value"],
-            })
+        # Filtra apenas resultados válidos
+        matched_data = [r for r in results if r and not isinstance(r, Exception)]
         
         print(f"   ✅ Processamento concluído: {len(matched_data)}/{total} lotes com lances")
         return matched_data
@@ -162,7 +205,7 @@ class SodreSantoroMonitor:
                 "external_id": item["external_id"],
                 "lot_number": item["lot_number"],
                 "total_bids": item["total_bids"],
-                "total_bidders": 0,  # Sodré não fornece
+                "total_bidders": 0,
                 "current_value": item["current_value"],
                 "captured_at": captured_at,
             })
@@ -224,12 +267,13 @@ class SodreSantoroMonitor:
             print(f"❌ Erro ao salvar histórico: {e}")
             return 0
     
-    def run(self):
-        """Executa monitoramento completo"""
+    async def run_async(self):
+        """Executa monitoramento completo (async)"""
         print("\n" + "="*70)
-        print("🔵 SODRÉ SANTORO MONITOR - HISTÓRICO DE LANCES")
+        print("🔵 SODRÉ SANTORO MONITOR - HISTÓRICO DE LANCES (ASYNC)")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"⚡ Paralelismo: {MAX_CONCURRENT} lotes simultâneos")
         print("="*70)
         
         if not self.load_database_items():
@@ -240,25 +284,8 @@ class SodreSantoroMonitor:
             print("⚠️ Nenhum item ativo encontrado no banco")
             return True
         
-        # Scraping com Playwright
-        all_matched = []
-        
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--disable-blink-features=AutomationControlled']
-            )
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                locale='pt-BR',
-            )
-            page = context.new_page()
-            
-            # Processa todos os lotes do banco
-            all_matched = self.process_all_lots(page)
-            
-            browser.close()
+        # Processa todos os lotes em paralelo
+        all_matched = await self.process_all_lots_async()
         
         # Cria registros de histórico
         all_records = self.create_history_records(all_matched)
@@ -291,7 +318,7 @@ def main():
     """Execução principal"""
     try:
         monitor = SodreSantoroMonitor()
-        success = monitor.run()
+        success = asyncio.run(monitor.run_async())
         
         if success:
             print("\n✅ Monitor executado com sucesso!")
