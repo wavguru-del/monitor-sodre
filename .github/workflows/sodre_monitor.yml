@@ -3,7 +3,7 @@ name: Sodré Santoro Monitor
 on:
   schedule:
     # Executa a cada 4 horas
-    - cron: '0 */4 * * *'
+    - cron: '0 */6 * * *'
   
   # Permite execução manual
   workflow_dispatch:
