@@ -1,0 +1,41 @@
+name: Auction Monitor (Parallel)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  
+  # Permite execução manual
+  workflow_dispatch:
+
+jobs:
+  capture-snapshot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          pip install supabase playwright beautifulsoup4
+      
+      - name: Instalar browsers do Playwright
+        run: |
+          playwright install --with-deps chromium
+      
+      - name: Capturar snapshot (Paralelo)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python scraper/superbid_monitor.py
+      
+      - name: Verificar resultado
+        if: failure()
+        run: echo "❌ Snapshot falhou!"
